@@ -1,5 +1,5 @@
-# Connection details for Soda Core
-data_source youtube_dw
+# warehouse.yml - Soda Core data source configuration
+data_source youtube_dw:
   type: postgres
   host: ${PGHOST}
   port: ${PGPORT}

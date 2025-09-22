@@ -57,7 +57,7 @@ def run_soda_scan(**context):
             "soda",
             "scan",
             "-d", DATA_SOURCE_NAME,
-            os.path.join(SODA_PROJECT_DIR, "warehouse.yml"),
+            "-c", os.path.join(SODA_PROJECT_DIR, "warehouse.yml"),
             os.path.join(SODA_PROJECT_DIR, "checks.yml"),
         ]
 
