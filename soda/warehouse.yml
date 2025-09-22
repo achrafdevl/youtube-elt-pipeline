@@ -1,0 +1,8 @@
+# Connection details for Soda Core
+data_source youtube_dw
+  type: postgres
+  host: ${PGHOST}
+  port: ${PGPORT}
+  username: ${PGUSER}
+  password: ${PGPASSWORD}
+  database: ${PGDATABASE}

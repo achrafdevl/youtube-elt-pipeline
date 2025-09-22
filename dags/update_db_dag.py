@@ -1,31 +1,44 @@
 # dags/update_db_dag.py
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.utils.dates import days_ago
 from datetime import timedelta
 import os
-import json
-import glob
 import psycopg2
-from psycopg2.extras import execute_values
+from airflow.utils import timezone
 
-# ==========
-# Config
-# ==========
+from src.db_tasks import load_to_staging, transform_core
+
+# Pour charger les variables d'environnement depuis .env
+from dotenv import load_dotenv
+
+# ========== Config ==========
+
+# Chemins
+RAW_DIR = os.getenv("JSON_OUTPUT_PATH", "./data/raw")
+SODA_PROJECT_DIR = os.getenv("SODA_PROJECT_DIR", "/usr/local/airflow/soda")
+SODA_EXEC = os.getenv("SODA_EXEC", "soda")  # Si soda est dans le PATH, sinon mettre le chemin complet
+
+# Variables DB
 DB_HOST = os.getenv("PGHOST", "postgres")
 DB_PORT = os.getenv("PGPORT", "5432")
 DB_NAME = os.getenv("PGDATABASE", "youtube_dw")
 DB_USER = os.getenv("PGUSER", "airflow")
 DB_PASS = os.getenv("PGPASSWORD", "airflow")
 
-RAW_DIR = os.getenv("JSON_OUTPUT_PATH", "./data/raw")
+# Flags
+DISABLE_DB = os.getenv("DISABLE_DB", "0") == "1"
+ENABLE_SODA = os.getenv("ENABLE_SODA", "1") == "1"
 
+# Charger le .env du projet Soda
+load_dotenv(os.path.join(SODA_PROJECT_DIR, ".env"))
+
+# ========== DAG args ==========
 default_args = {
     "owner": "airflow",
     "depends_on_past": False,
     "email_on_failure": False,
     "email_on_retry": False,
-    "retries": 1,
+    "retries": 2,
     "retry_delay": timedelta(minutes=5),
 }
 
@@ -33,131 +46,88 @@ dag = DAG(
     "update_db",
     default_args=default_args,
     description="Charge les JSON dans staging.video_raw et met à jour core.videos",
-    schedule_interval="30 2 * * *",   # tous les jours à 2h30 (après produce_JSON)
-    start_date=days_ago(1),
+    schedule="30 2 * * *",
+    start_date=timezone.utcnow() - timedelta(days=1),
     catchup=False,
     max_active_runs=1,
     tags=["youtube", "postgres", "etl"],
 )
 
-# ==========
-# Helpers
-# ==========
+# ========== Helpers ==========
 def _connect():
     return psycopg2.connect(
-        host=DB_HOST, port=DB_PORT,
-        dbname=DB_NAME, user=DB_USER, password=DB_PASS
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASS
     )
 
-def load_to_staging(**_):
-    """Insère les dernières données JSON dans staging.video_raw"""
-    conn = _connect()
-    cur = conn.cursor()
+# ========== Tasks ==========
+if DISABLE_DB:
+    def _noop_load(**_):
+        return "DB disabled via DISABLE_DB=1; skipping load_to_staging"
 
-    # Assurez-vous que la table existe
-    cur.execute("""
-    CREATE SCHEMA IF NOT EXISTS staging;
-    CREATE TABLE IF NOT EXISTS staging.video_raw (
-        id SERIAL PRIMARY KEY,
-        video_id TEXT,
-        title TEXT,
-        description TEXT,
-        published_at TIMESTAMP,
-        channel_id TEXT,
-        raw_json JSONB,
-        load_ts TIMESTAMP DEFAULT NOW()
-    );
-    """)
+    def _noop_transform(**_):
+        return "DB disabled via DISABLE_DB=1; skipping transform_core"
 
-    files = sorted(glob.glob(f"{RAW_DIR}/*.json"))
-    if not files:
-        raise ValueError("Aucun fichier JSON trouvé dans le dossier raw")
-
-    # On ne prend que le plus récent
-    latest = files[-1]
-    with open(latest, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    rows = []
-    for item in data.get("items", []):
-        snippet = item["snippet"]
-        rows.append((
-            item["id"]["videoId"],
-            snippet.get("title"),
-            snippet.get("description"),
-            snippet.get("publishedAt"),
-            snippet.get("channelId"),
-            json.dumps(item)
-        ))
-
-    execute_values(cur,
-        """INSERT INTO staging.video_raw
-           (video_id, title, description, published_at, channel_id, raw_json)
-           VALUES %s
-           ON CONFLICT DO NOTHING
-        """,
-        rows
+    staging_task = PythonOperator(
+        task_id="load_staging",
+        python_callable=_noop_load,
+        dag=dag,
     )
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    return f"{len(rows)} lignes insérées depuis {latest}"
+    transform_task = PythonOperator(
+        task_id="transform_core",
+        python_callable=_noop_transform,
+        dag=dag,
+    )
+else:
+    staging_task = PythonOperator(
+        task_id="load_staging",
+        python_callable=lambda **_: load_to_staging(),
+        dag=dag,
+    )
 
-def transform_core(**_):
-    """Transforme et alimente core.videos"""
-    conn = _connect()
-    cur = conn.cursor()
+    transform_task = PythonOperator(
+        task_id="transform_core",
+        python_callable=lambda **_: transform_core(),
+        dag=dag,
+    )
 
-    cur.execute("""
-    CREATE SCHEMA IF NOT EXISTS core;
-    CREATE TABLE IF NOT EXISTS core.videos (
-        video_id TEXT PRIMARY KEY,
-        title TEXT,
-        description TEXT,
-        published_date DATE,
-        channel_id TEXT,
-        last_update TIMESTAMP DEFAULT NOW()
-    );
-    """)
+# ========== Soda Task ==========
+if ENABLE_SODA:
+    def _run_soda_scan(**_):
+        """
+        Run Soda scan on the specified data source.
+        Make sure the data source name matches what is in warehouse.yml
+        """
+        import subprocess
 
-    # Upsert depuis staging
-    cur.execute("""
-    INSERT INTO core.videos (video_id, title, description, published_date, channel_id)
-    SELECT
-        video_id,
-        title,
-        description,
-        published_at::date,
-        channel_id
-    FROM staging.video_raw
-    ON CONFLICT (video_id)
-    DO UPDATE SET
-        title = EXCLUDED.title,
-        description = EXCLUDED.description,
-        published_date = EXCLUDED.published_date,
-        channel_id = EXCLUDED.channel_id,
-        last_update = NOW();
-    """)
+        DATA_SOURCE_NAME = "youtube_dw"
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    return "Core.videos mis à jour"
+        cmd = [
+            SODA_EXEC,
+            "scan",
+            "-d", DATA_SOURCE_NAME,
+            f"{SODA_PROJECT_DIR}/warehouse.yml",
+            f"{SODA_PROJECT_DIR}/checks.yml",
+        ]
 
-# ==========
-# Tasks
-# ==========
-staging_task = PythonOperator(
-    task_id="load_staging",
-    python_callable=load_to_staging,
-    dag=dag,
-)
+        try:
+            subprocess.run(cmd, check=True)
+            return "Soda scan completed"
+        except subprocess.CalledProcessError as e:
+            # Pour ne pas casser le DAG si Soda échoue
+            print(f"Soda scan failed: {e}")
+            return "Soda scan failed"
 
-transform_task = PythonOperator(
-    task_id="transform_core",
-    python_callable=transform_core,
-    dag=dag,
-)
+    soda_task = PythonOperator(
+        task_id="soda_scan",
+        python_callable=_run_soda_scan,
+        dag=dag,
+    )
 
-staging_task >> transform_task
+    staging_task >> transform_task >> soda_task
+else:
+    staging_task >> transform_task

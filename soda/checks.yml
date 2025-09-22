@@ -1,0 +1,31 @@
+checks:
+  - table: core.videos
+    checks:
+      - row_count:
+          warn_if_less_than: 1
+      - missing_count:
+          column: video_id
+          fail_if_more_than: 0
+      - invalid_count:
+          column: duration_seconds
+          fail_if_more_than: 0
+      - freshness:
+          column: published_date
+          warn_if_older_than: 365d
+      - schema:
+          warn_if_missing:
+            - video_id
+            - title
+            - published_date
+            - channel_id
+
+  - table: staging.video_raw
+    checks:
+      - missing_count:
+          column: video_id
+          fail_if_more_than: 0
+      - schema:
+          warn_if_missing:
+            - video_id
+            - duration_iso
+            - duration_seconds

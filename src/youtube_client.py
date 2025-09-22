@@ -1,173 +1,226 @@
 # src/youtube_client.py
 import os
-import time
 import json
+import time
 import logging
-from datetime import datetime
-from typing import List, Dict, Optional
-
-import isodate
-from googleapiclient.discovery import build
+from datetime import datetime, timedelta
+from isodate import parse_duration
 from googleapiclient.errors import HttpError
-from dotenv import load_dotenv
+from typing import List, Dict, Any, Optional
 
-load_dotenv()
-
+# Configuration du logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("youtube_client")
+logger = logging.getLogger(__name__)
 
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-DEFAULT_OUTPUT = os.getenv("JSON_OUTPUT_PATH", "./data/raw")
-MAX_VIDEOS_DEFAULT = int(os.getenv("MAX_VIDEOS", "500"))
-
-# chunk helper
-def chunked(iterable, n):
-    for i in range(0, len(iterable), n):
-        yield iterable[i:i + n]
-
-def iso_duration_to_seconds(duration_iso: str) -> Optional[int]:
-    try:
-        td = isodate.parse_duration(duration_iso)
-        return int(td.total_seconds())
-    except Exception:
-        return None
+def iso_duration_to_seconds(duration_iso: str) -> int:
+    """
+    Convertit une durée ISO 8601 (ex: "PT1H2M30S") en nombre total de secondes.
+    """
+    if not duration_iso:
+        return 0
+    duration_obj = parse_duration(duration_iso)
+    return int(duration_obj.total_seconds())
 
 class YouTubeClient:
-    def __init__(self, api_key: str, sleep_on_quota=2.0):
-        if not api_key:
-            raise ValueError("YOUTUBE_API_KEY required")
+    def __init__(self, api_key: str):
         self.api_key = api_key
-        self.youtube = build("youtube", "v3", developerKey=self.api_key)
-        self.sleep_on_quota = sleep_on_quota
+        # Lazy import to avoid hard dependency during module import (useful for tests)
+        from googleapiclient.discovery import build  # type: ignore
+        self.youtube = build("youtube", "v3", developerKey=api_key)
+        
+        # Gestion des quotas API
+        self.daily_quota_limit = 10000  # Quota quotidien YouTube API
+        self.quota_used_today = 0
+        self.quota_reset_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        
+        # Coûts approximatifs des opérations API (en unités de quota)
+        self.api_costs = {
+            'search': 100,  # search.list
+            'videos': 1,    # videos.list
+        }
 
-    def _execute_with_retries(self, request, max_retries=6):
-        backoff = 1.0
-        for attempt in range(1, max_retries + 1):
+    def _check_quota(self, operation_cost: int) -> bool:
+        """Vérifie si on a assez de quota pour l'opération"""
+        if datetime.now() >= self.quota_reset_time:
+            self.quota_used_today = 0
+            self.quota_reset_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        
+        if self.quota_used_today + operation_cost > self.daily_quota_limit:
+            logger.warning(f"Quota insuffisant: {self.quota_used_today}/{self.daily_quota_limit}")
+            return False
+        return True
+
+    def _make_api_call_with_retry(self, api_call, operation_type: str, max_retries: int = 3):
+        """Effectue un appel API avec retry et gestion d'erreurs"""
+        for attempt in range(max_retries):
             try:
-                return request.execute()
+                if not self._check_quota(self.api_costs[operation_type]):
+                    raise Exception("Quota API insuffisant")
+                
+                result = api_call.execute()
+                self.quota_used_today += self.api_costs[operation_type]
+                logger.info(f"Quota utilisé: {self.quota_used_today}/{self.daily_quota_limit}")
+                return result
+                
             except HttpError as e:
-                status = getattr(e.resp, "status", None)
-                logger.warning(f"HttpError status={status} attempt={attempt}: {e}")
-                # throttling / quota / server errors -> backoff and retry
-                if status in (403, 429, 500, 502, 503, 504):
-                    sleep_time = backoff * (2 ** (attempt - 1))
-                    logger.info(f"Sleeping {sleep_time:.1f}s before retrying...")
-                    time.sleep(sleep_time)
-                    continue
-                # for other HttpErrors, raise
-                raise
+                if e.resp.status == 403 and "quotaExceeded" in str(e):
+                    logger.error("Quota API dépassé")
+                    raise Exception("Quota API dépassé")
+                elif e.resp.status == 429:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Rate limit atteint, attente {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Erreur API: {e}")
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(2 ** attempt)
             except Exception as e:
-                logger.exception("Unexpected error calling YouTube API")
-                time.sleep(backoff)
-                backoff *= 2
-        raise RuntimeError("Max retries reached for YouTube API request")
+                logger.error(f"Erreur inattendue: {e}")
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(2 ** attempt)
 
-    def fetch_video_ids_for_channel(self, channel_id: str, max_results: int = MAX_VIDEOS_DEFAULT) -> List[str]:
-        """
-        Uses the search.list endpoint (type=video) to collect videoIds for the channel (newest first).
-        """
-        logger.info("Fetching video ids for channel %s (max %s)", channel_id, max_results)
-        ids = []
-        page_token = None
+    def _get_channel_id(self, channel_handle: str) -> str:
+        """Récupère l'ID de la chaîne à partir du handle"""
+        search_call = self.youtube.search().list(
+            q=channel_handle,
+            type="channel",
+            part="id",
+            maxResults=1
+        )
+        channel_resp = self._make_api_call_with_retry(search_call, 'search')
+        
+        if not channel_resp["items"]:
+            raise ValueError(f"Impossible de trouver le handle {channel_handle}")
+        return channel_resp["items"][0]["id"]["channelId"]
 
-        while True:
-            req = self.youtube.search().list(
-                part="id",
+    def _get_videos_with_pagination(self, channel_id: str, max_videos: int) -> List[str]:
+        """Récupère les IDs des vidéos avec pagination"""
+        all_video_ids = []
+        next_page_token = None
+        max_results_per_page = 50  # Maximum par page
+        
+        while len(all_video_ids) < max_videos:
+            remaining = max_videos - len(all_video_ids)
+            current_max = min(max_results_per_page, remaining)
+            
+            search_call = self.youtube.search().list(
                 channelId=channel_id,
-                maxResults=50,  # max allowed per call
+                part="id",
                 order="date",
+                maxResults=current_max,
                 type="video",
-                pageToken=page_token
+                pageToken=next_page_token
             )
-            resp = self._execute_with_retries(req)
-            items = resp.get("items", [])
-            for it in items:
-                vid = it.get("id", {}).get("videoId")
-                if vid:
-                    ids.append(vid)
-                if len(ids) >= max_results:
-                    return ids[:max_results]
-            page_token = resp.get("nextPageToken")
-            if not page_token:
+            
+            videos_resp = self._make_api_call_with_retry(search_call, 'search')
+            
+            if not videos_resp["items"]:
                 break
-            # light sleep to avoid bursting
+                
+            all_video_ids.extend([item["id"]["videoId"] for item in videos_resp["items"]])
+            
+            next_page_token = videos_resp.get("nextPageToken")
+            if not next_page_token:
+                break
+                
+            # Petite pause entre les pages pour éviter le rate limiting
             time.sleep(0.1)
+        
+        return all_video_ids[:max_videos]
 
-        logger.info("Collected %d video ids", len(ids))
-        return ids
-
-    def fetch_videos_details(self, video_ids: List[str]) -> List[Dict]:
-        """
-        Calls videos.list in chunks (max 50 ids/chunk) to get snippet, contentDetails, statistics.
-        Returns normalized list of dicts.
-        """
-        logger.info("Fetching details for %d videos", len(video_ids))
-        result = []
-        for chunk in chunked(video_ids, 50):
-            req = self.youtube.videos().list(
-                part="snippet,contentDetails,statistics",
-                id=",".join(chunk),
-                maxResults=50,
-                # fields can be used to limit response size; omitted here for readability
+    def _get_video_details(self, video_ids: List[str]) -> List[Dict[str, Any]]:
+        """Récupère les détails des vidéos par batch de 50"""
+        all_videos = []
+        
+        # Traiter par batch de 50 (limite de l'API)
+        for i in range(0, len(video_ids), 50):
+            batch_ids = video_ids[i:i+50]
+            
+            details_call = self.youtube.videos().list(
+                id=",".join(batch_ids),
+                part="snippet,contentDetails,statistics"
             )
-            resp = self._execute_with_retries(req)
-            for item in resp.get("items", []):
-                snip = item.get("snippet", {})
-                content = item.get("contentDetails", {})
-                stats = item.get("statistics", {})
-                parsed = {
-                    "video_id": item.get("id"),
-                    "title": snip.get("title"),
-                    "published_at": snip.get("publishedAt"),
-                    "duration_iso": content.get("duration"),
-                    "duration_seconds": iso_duration_to_seconds(content.get("duration")) if content.get("duration") else None,
-                    "view_count": int(stats.get("viewCount")) if stats.get("viewCount") is not None else None,
-                    "like_count": int(stats.get("likeCount")) if stats.get("likeCount") is not None else None,
-                    "comment_count": int(stats.get("commentCount")) if stats.get("commentCount") is not None else None,
-                    "channel_id": snip.get("channelId"),
-                    "raw": item  # keep raw for debugging
-                }
-                result.append(parsed)
-            # small sleep to be gentle
+            
+            details = self._make_api_call_with_retry(details_call, 'videos')
+            
+            for v in details["items"]:
+                snippet = v["snippet"]
+                stats = v["statistics"]
+                dur_iso = v["contentDetails"]["duration"]
+                dur_obj = parse_duration(dur_iso)
+                total_seconds = int(dur_obj.total_seconds())
+                minutes, seconds = divmod(total_seconds, 60)
+                duration_readable = f"{minutes}:{seconds:02d}"
+
+                all_videos.append({
+                    "title": snippet.get("title"),
+                    "description": snippet.get("description"),
+                    "duration_iso": dur_iso,
+                    "duration_seconds": total_seconds,
+                    "video_id": v["id"],
+                    "like_count": stats.get("likeCount", "0"),
+                    "view_count": stats.get("viewCount", "0"),
+                    "published_at": snippet.get("publishedAt"),
+                    "channel_id": snippet.get("channelId"),
+                    "comment_count": stats.get("commentCount", "0"),
+                    "duration_readable": duration_readable
+                })
+            
+            # Petite pause entre les batches
             time.sleep(0.1)
-        logger.info("Fetched details for %d videos", len(result))
-        return result
+        
+        return all_videos
 
-    def fetch_and_save_channel(self, channel_id: str, out_dir: str = DEFAULT_OUTPUT, max_videos: int = MAX_VIDEOS_DEFAULT) -> str:
-        os.makedirs(out_dir, exist_ok=True)
-        ids = self.fetch_video_ids_for_channel(channel_id, max_results=max_videos)
-        details = self.fetch_videos_details(ids)
-        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        safe_channel = channel_id.replace("/", "_")
-        filename = f"{safe_channel}_{ts}.json"
-        filepath = os.path.join(out_dir, filename)
-        logger.info("Saving %d records to %s", len(details), filepath)
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump({
-                "fetched_at": ts,
+    def fetch_and_save_channel(self, channel_handle: str, out_dir: str, max_videos: int = 500):
+        """
+        Récupère les dernières vidéos avec stats + durée, 
+        et sauvegarde dans le format custom demandé.
+        Gère la pagination, les quotas API et les erreurs.
+        """
+        try:
+            # 1. Trouver l'ID de la chaîne
+            logger.info(f"Recherche de la chaîne: {channel_handle}")
+            channel_id = self._get_channel_id(channel_handle)
+            logger.info(f"Chaîne trouvée: {channel_id}")
+
+            # 2. Récupérer les vidéos avec pagination
+            logger.info(f"Récupération de {max_videos} vidéos maximum")
+            video_ids = self._get_videos_with_pagination(channel_id, max_videos)
+            
+            if not video_ids:
+                raise ValueError("Aucune vidéo trouvée.")
+            
+            logger.info(f"Récupération des détails de {len(video_ids)} vidéos")
+
+            # 3. Récupérer les détails des vidéos
+            videos = self._get_video_details(video_ids)
+
+            # 4. Construire l'objet final
+            result = {
+                "channel_handle": channel_handle,
                 "channel_id": channel_id,
-                "count": len(details),
-                "videos": details
-            }, f, ensure_ascii=False, indent=2)
-        return filepath
+                "extraction_date": datetime.utcnow().isoformat(),
+                "total_videos": len(videos),
+                "quota_used": self.quota_used_today,
+                "quota_remaining": self.daily_quota_limit - self.quota_used_today,
+                "videos": videos
+            }
 
-if __name__ == "__main__":
-    import argparse
+            # 5. Sauvegarde
+            os.makedirs(out_dir, exist_ok=True)
+            file_path = os.path.join(
+                out_dir,
+                f"{channel_handle}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+            )
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=4)
 
-    parser = argparse.ArgumentParser(description="Fetch videos from a YouTube channel and save JSON")
-    parser.add_argument("--channel", "-c", help="Channel ID (overrides TARGET_CHANNEL_ID env var)", default=None)
-    parser.add_argument("--max", "-m", type=int, default=None, help="Max videos to fetch")
-    parser.add_argument("--out", "-o", default=None, help="Output directory")
-    args = parser.parse_args()
+            logger.info(f"Données sauvegardées dans: {file_path}")
+            logger.info(f"Quota utilisé: {self.quota_used_today}/{self.daily_quota_limit}")
+            return file_path
 
-    channel = args.channel or os.getenv("TARGET_CHANNEL_ID")
-    if not channel:
-        raise SystemExit("Provide --channel or set TARGET_CHANNEL_ID in env/.env")
-
-    api_key = os.getenv("YOUTUBE_API_KEY") or YOUTUBE_API_KEY
-    client = YouTubeClient(api_key=api_key)
-    out = args.out or os.getenv("JSON_OUTPUT_PATH", "./data/raw")
-    mx = args.max or int(os.getenv("MAX_VIDEOS", MAX_VIDEOS_DEFAULT))
-
-    saved = client.fetch_and_save_channel(channel_id=channel, out_dir=out, max_videos=mx)
-    logger.info("Saved data to %s", saved)
+        except Exception as e:
+            logger.error(f"Erreur lors de l'extraction: {e}")
+            raise
