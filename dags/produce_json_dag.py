@@ -4,6 +4,7 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 import os
 import sys
+from dotenv import load_dotenv, find_dotenv
 
 # Ensure `src` is importable when running inside Airflow
 CURRENT_DIR = os.path.dirname(__file__)
@@ -12,15 +13,19 @@ SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 if SRC_DIR not in sys.path:
     sys.path.append(SRC_DIR)
 
-from youtube_client import YouTubeClient
+from youtube_requests_extractor import run_flow
+import json
+
+# Charger les variables d'environnement depuis un fichier .env si présent
+# Ne pas écraser les variables déjà définies par l'environnement/Airflow
+load_dotenv(find_dotenv(), override=False)
 
 # =======================
 # Variables / Config
 # =======================
-CHANNEL_HANDLE = os.getenv("TARGET_CHANNEL_HANDLE", "MrBeast")  # Handle plutôt que ID
+CHANNEL_HANDLE = os.getenv("TARGET_CHANNEL_HANDLE", "@MrBeast")  # Handle plutôt que ID
 API_KEY = os.getenv("YOUTUBE_API_KEY")
-OUTPUT_DIR = os.getenv("JSON_OUTPUT_PATH", "./data/raw")
-MAX_VIDEOS = int(os.getenv("MAX_VIDEOS", "500"))
+OUTPUT_DIR = os.getenv("JSON_OUTPUT_PATH", "./dags/data")
 
 # =======================
 # DAG Arguments
@@ -51,13 +56,21 @@ dag = DAG(
 def fetch_and_save(**context):
     if not API_KEY:
         raise ValueError("La variable d'environnement YOUTUBE_API_KEY doit être définie.")
-    client = YouTubeClient(api_key=API_KEY)
-    saved_file = client.fetch_and_save_channel(
-        channel_handle=CHANNEL_HANDLE,
-        out_dir=OUTPUT_DIR,
-        max_videos=MAX_VIDEOS
-    )
-    return saved_file
+    saved_path = run_flow(api_key=API_KEY, channel_handle=CHANNEL_HANDLE, out_dir=OUTPUT_DIR)
+    # Charger un petit résumé pour affichage dans l'UI Airflow (éviter XCom volumineux)
+    try:
+        with open(saved_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        summary = {
+            "saved_path": saved_path,
+            "channel_handle": data.get("channel_handle"),
+            "total_videos": data.get("total_videos"),
+            "extraction_date": data.get("extraction_date"),
+        }
+        return summary
+    except Exception:
+        # En cas d'échec de lecture, on renvoie au moins le chemin
+        return {"saved_path": saved_path}
 
 # =======================
 # PythonOperator

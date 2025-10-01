@@ -3,20 +3,33 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import timedelta
 import os
+import sys
 import psycopg2
 from airflow.utils import timezone
 
-from src.db_tasks import load_to_staging, transform_core
+# Charger les variables d'environnement depuis .env (racine du projet)
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv(), override=False)
 
-# Pour charger les variables d'environnement depuis .env
-from dotenv import load_dotenv
+# S'assurer que le dossier `src` est importable (aligné avec produce_json_dag.py)
+CURRENT_DIR = os.path.dirname(__file__)
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+SRC_DIR = os.path.join(PROJECT_ROOT, "src")
+if SRC_DIR not in sys.path:
+    sys.path.append(SRC_DIR)
+
+# Aligner le dossier de sortie par défaut avec le DAG d'extraction
+if not os.getenv("JSON_OUTPUT_PATH"):
+    os.environ["JSON_OUTPUT_PATH"] = "./dags/data"
+
+from src.db_tasks import load_to_staging, transform_core
 
 # ========== Config ==========
 
 # Chemins
-RAW_DIR = os.getenv("JSON_OUTPUT_PATH", "./data/raw")
+RAW_DIR = os.getenv("JSON_OUTPUT_PATH", "./dags/data")
 SODA_PROJECT_DIR = os.getenv("SODA_PROJECT_DIR", "/usr/local/airflow/soda")
-SODA_EXEC = os.getenv("SODA_EXEC", "soda")  # Si soda est dans le PATH, sinon mettre le chemin complet
+SODA_EXEC = os.getenv("SODA_EXEC", "soda")  
 
 # Variables DB
 DB_HOST = os.getenv("PGHOST", "postgres")
@@ -24,6 +37,36 @@ DB_PORT = os.getenv("PGPORT", "5432")
 DB_NAME = os.getenv("PGDATABASE", "youtube_dw")
 DB_USER = os.getenv("PGUSER", "airflow")
 DB_PASS = os.getenv("PGPASSWORD", "airflow")
+
+# Optionally source DB creds from an Airflow Connection (keeps backward compatibility)
+try:
+    from airflow.hooks.base import BaseHook
+
+    try:
+        conn = BaseHook.get_connection("youtube_dw")
+        if conn:
+            os.environ["PGHOST"] = conn.host or DB_HOST
+            if conn.port:
+                os.environ["PGPORT"] = str(conn.port)
+            if conn.schema:
+                os.environ["PGDATABASE"] = conn.schema
+            if conn.login:
+                os.environ["PGUSER"] = conn.login
+            if conn.password:
+                os.environ["PGPASSWORD"] = conn.password
+
+            # Refresh in-module variables after env update
+            DB_HOST = os.getenv("PGHOST", DB_HOST)
+            DB_PORT = os.getenv("PGPORT", DB_PORT)
+            DB_NAME = os.getenv("PGDATABASE", DB_NAME)
+            DB_USER = os.getenv("PGUSER", DB_USER)
+            DB_PASS = os.getenv("PGPASSWORD", DB_PASS)
+    except Exception:
+        # If connection not found or outside Airflow context, proceed with env defaults
+        pass
+except Exception:
+    # Airflow might not be available in unit tests; ignore
+    pass
 
 # Flags
 DISABLE_DB = os.getenv("DISABLE_DB", "0") == "1"

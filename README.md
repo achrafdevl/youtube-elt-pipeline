@@ -75,18 +75,32 @@ ENABLE_SODA=1
 
 ### 3. Démarrage
 
-```bash
+```bash .venv
 source .venv/Scripts/activate
 ```
 
-
-```bash
+```bash 
 astro dev start
 ```
 
 Interface Airflow : http://localhost:8080
 
-### 4. DAGs Disponibles
+### 4. Extraction rapide (CLI locale)
+
+Vous pouvez lancer une extraction locale et sauvegarder automatiquement le JSON dans `data/raw` sans passer par Airflow :
+
+```bash
+export YOUTUBE_API_KEY=your-youtube-api-key
+python -m src.extract_to_raw --handle @MrBeast --out ./data/raw --max 200
+```
+
+Les options sont facultatives et ont des valeurs par défaut :
+
+- `--handle` (défaut: valeur de `TARGET_CHANNEL_HANDLE` ou `@MrBeast`)
+- `--out` (défaut: valeur de `JSON_OUTPUT_PATH` ou `./data/raw`)
+- `--max` (défaut: valeur de `MAX_VIDEOS` ou `500`)
+
+### 5. DAGs Disponibles
 
 | DAG            | Horaire | Description                    |
 | -------------- | ------- | ------------------------------ |
@@ -259,3 +273,10 @@ Pour toute question ou problème :
 2. Consulter les logs Airflow
 3. Exécuter les tests : `astro dev run pytest -v`
 4. Ouvrir une issue sur GitHub
+
+
+
+
+docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" | findstr /I postgres
+
+\dt staging.*
