@@ -2,7 +2,7 @@ import os
 import argparse
 from datetime import datetime
 
-from youtube_client import YouTubeClient
+# from youtube_client import YouTubeClient  # Commented out since youtube_client.py was deleted
 
 
 def main():
@@ -13,17 +13,20 @@ def main():
 
     args = parser.parse_args()
 
-    api_key = os.getenv("YOUTUBE_API_KEY")
-    if not api_key:
-        raise SystemExit("YOUTUBE_API_KEY environment variable is required")
+    # Commented out since youtube_client.py was deleted
+    # api_key = os.getenv("YOUTUBE_API_KEY")
+    # if not api_key:
+    #     raise SystemExit("YOUTUBE_API_KEY environment variable is required")
 
-    client = YouTubeClient(api_key=api_key)
-    saved = client.fetch_and_save_channel(
-        channel_handle=args.channel_handle,
-        out_dir=args.out_dir,
-        max_videos=args.max_videos,
-    )
-    print(saved)
+    # client = YouTubeClient(api_key=api_key)
+    # saved = client.fetch_and_save_channel(
+    #     channel_handle=args.channel_handle,
+    #     out_dir=args.out_dir,
+    #     max_videos=args.max_videos,
+    # )
+    # print(saved)
+    
+    print("YouTube client functionality has been disabled")
 
 
 if __name__ == "__main__":

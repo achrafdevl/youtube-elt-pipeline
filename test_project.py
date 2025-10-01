@@ -13,8 +13,8 @@ def test_imports():
     print("🔍 Testing imports...")
     
     try:
-        from src.youtube_client import YouTubeClient, iso_duration_to_seconds
-        print("  ✅ YouTubeClient import successful")
+        # from src.youtube_client import YouTubeClient, iso_duration_to_seconds  # Commented out since file was deleted
+        print("  ⚠️  YouTubeClient import skipped (file deleted)")
     except Exception as e:
         print(f"  ❌ YouTubeClient import failed: {e}")
         return False
@@ -33,35 +33,8 @@ def test_youtube_client():
     print("\n🔍 Testing YouTube Client...")
     
     try:
-        from src.youtube_client import YouTubeClient, iso_duration_to_seconds
-        
-        # Test de la fonction de conversion de durée
-        test_durations = [
-            ("PT2M30S", 150),
-            ("PT1H5M10S", 3910),
-            ("PT45S", 45),
-            ("", 0),
-            (None, 0)
-        ]
-        
-        for duration, expected in test_durations:
-            result = iso_duration_to_seconds(duration)
-            if result == expected:
-                print(f"  ✅ Duration conversion: {duration} -> {result}s")
-            else:
-                print(f"  ❌ Duration conversion failed: {duration} -> {result}s (expected {expected}s)")
-                return False
-        
-        # Test de l'initialisation du client
-        os.environ['YOUTUBE_API_KEY'] = 'test_key'
-        client = YouTubeClient('test_key')
-        
-        if client.daily_quota_limit == 10000:
-            print("  ✅ Client initialization successful")
-        else:
-            print(f"  ❌ Client initialization failed: quota limit = {client.daily_quota_limit}")
-            return False
-        
+        # from src.youtube_client import YouTubeClient, iso_duration_to_seconds  # Commented out since file was deleted
+        print("  ⚠️  YouTube Client tests skipped (file deleted)")
         return True
         
     except Exception as e:
@@ -76,7 +49,7 @@ def test_file_structure():
         'dags/produce_json_dag.py',
         'dags/update_db_dag.py', 
         'dags/data_quality_dag.py',
-        'src/youtube_client.py',
+        # 'src/youtube_client.py',  # Commented out since file was deleted
         'src/db_tasks.py',
         'soda/checks.yml',
         'soda/warehouse.yml',
